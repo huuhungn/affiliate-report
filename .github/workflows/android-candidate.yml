@@ -80,7 +80,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
-      - run: python -m pip install --disable-pip-version-check "httpx==0.28.1"
+      # The cross-check phase decrypts and re-exports AFFSYNC1 packages with the real desktop
+      # SyncService, so this job needs the desktop runtime stack rather than httpx alone.
+      - run: python -m pip install --disable-pip-version-check -r requirements-api.txt
       - uses: actions/download-artifact@v8
         with:
           name: ${{ env.ANDROID_CI_NAME }}

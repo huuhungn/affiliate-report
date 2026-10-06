@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+import hashlib
+import json
+import re
 import threading
 import time
+import unicodedata
 
+from cryptography.exceptions import InvalidTag
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -40,10 +45,206 @@ from affiliate_report.sync_service import (
 )
 from affiliate_report.imports import undo_confirmation_phrase, undo_import
 from affiliate_report.reset_data import reset_sqlite_business_data
+from affiliate_report.version import APP_VERSION
 from tests.test_api import normalized
 from tests.test_api_auth import login, oidc_api
 
 PASSPHRASE = "mat-khau-dong-bo-rat-manh"
+
+# Frozen source-tree producer samples, never encrypted by the tests themselves.
+UNICODE_FIXTURES = Path(__file__).parent / "fixtures" / "affsync_unicode"
+UNICODE_CASES = [
+    (version, case)
+    for version in ("42.0.8", "48.0.1")
+    for case in ("nfc", "nfd", "emoji_mixed")
+]
+UNICODE_CASE_IDS = [f"crypto-{version}-{case}" for version, case in UNICODE_CASES]
+AUTHENTICATION_ERROR = "Mật khẩu không đúng hoặc gói đồng bộ đã bị chỉnh sửa."
+
+
+def unicode_golden_sample(version: str, case: str) -> tuple[dict, bytes]:
+    manifest = json.loads((UNICODE_FIXTURES / "manifest.json").read_text(encoding="utf-8"))
+    matches = [
+        sample for sample in manifest["samples"]
+        if sample["producer"]["cryptography"] == version and sample["case"] == case
+    ]
+    assert len(matches) == 1, (version, case)
+    sample = matches[0]
+    package = (UNICODE_FIXTURES / sample["filename"]).read_bytes()
+    assert len(package) == sample["size_bytes"]
+    assert hashlib.sha256(package).hexdigest() == sample["package_sha256"]
+    return sample, package
+
+
+def test_affsync_unicode_golden_manifest_covers_both_producers_and_exact_codepoints():
+    manifest = json.loads((UNICODE_FIXTURES / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema"] == 1
+    assert manifest["passwords_are_public_synthetic_test_data"] is True
+    assert len(manifest["samples"]) == len(UNICODE_CASES) == 6
+    assert {
+        (sample["producer"]["cryptography"], sample["case"])
+        for sample in manifest["samples"]
+    } == set(UNICODE_CASES)
+    assert {path.name for path in UNICODE_FIXTURES.glob("*.affsync")} == {
+        sample["filename"] for sample in manifest["samples"]
+    }
+    for version in ("42.0.8", "48.0.1"):
+        samples = {case: unicode_golden_sample(version, case)[0] for case in ("nfc", "nfd", "emoji_mixed")}
+        nfc, nfd, mixed = (samples[case]["passphrase"] for case in ("nfc", "nfd", "emoji_mixed"))
+        assert unicodedata.normalize("NFC", nfc) == nfc
+        assert unicodedata.normalize("NFD", nfc) == nfd
+        assert nfc != nfd and nfc.encode("utf-8") != nfd.encode("utf-8")
+        assert unicodedata.normalize("NFC", mixed) != mixed
+        assert unicodedata.normalize("NFD", mixed) != mixed
+        assert any(ord(char) > 0xFFFF for char in mixed)
+        for sample in samples.values():
+            password = sample["passphrase"]
+            assert sample["passphrase_codepoints"] == [f"U+{ord(char):04X}" for char in password]
+            assert sample["passphrase_utf8_hex"] == password.encode("utf-8").hex()
+            assert sample["producer"]["platform_system"] == "Windows"
+            assert sample["producer"]["packaged_runtime"] is False
+            assert sample["producer"]["entrypoint"] == "SyncService.export_package"
+            assert hashlib.sha256(sync_module._canonical(sample["expected_payload"])).hexdigest() == sample["plaintext_sha256"]
+
+
+@pytest.mark.parametrize("version,case", UNICODE_CASES, ids=UNICODE_CASE_IDS)
+def test_affsync_unicode_golden_static_file_decrypts_to_exact_payload(version, case):
+    sample, package = unicode_golden_sample(version, case)
+    assert package.startswith(b"AFFSYNC1")
+    payload = _decrypt_payload(package, sample["passphrase"])
+    assert payload == sample["expected_payload"]
+    # A full, valid package, not an arbitrary dictionary accepted only by AES-GCM.
+    SyncService._validate_payload(payload)
+
+
+@pytest.mark.parametrize("version,case", UNICODE_CASES, ids=UNICODE_CASE_IDS)
+def test_affsync_unicode_golden_wrong_password_has_authentication_error(version, case):
+    sample, package = unicode_golden_sample(version, case)
+    with pytest.raises(SyncError, match=f"^{re.escape(AUTHENTICATION_ERROR)}$") as caught:
+        _decrypt_payload(package, sample["passphrase"] + "-wrong")
+    assert type(caught.value) is SyncError
+    assert isinstance(caught.value.__cause__, InvalidTag)
+
+
+@pytest.mark.parametrize("version,case", UNICODE_CASES, ids=UNICODE_CASE_IDS)
+def test_affsync_unicode_golden_rejects_different_normalization(version, case):
+    sample, package = unicode_golden_sample(version, case)
+    # NFC and NFD look alike but derive different keys. A mixed string rejects both.
+    alternate_forms = ("NFD",) if case == "nfc" else ("NFC",) if case == "nfd" else ("NFC", "NFD")
+    for form in alternate_forms:
+        alternate = unicodedata.normalize(form, sample["passphrase"])
+        assert alternate != sample["passphrase"]
+        with pytest.raises(SyncError, match=f"^{re.escape(AUTHENTICATION_ERROR)}$") as caught:
+            _decrypt_payload(package, alternate)
+        assert type(caught.value) is SyncError
+        assert isinstance(caught.value.__cause__, InvalidTag)
+
+
+@pytest.mark.parametrize("version,case", UNICODE_CASES, ids=UNICODE_CASE_IDS)
+def test_affsync_unicode_golden_api_preview_imports_frozen_package(tmp_path, version, case):
+    sample, package = unicode_golden_sample(version, case)
+    payload = sample["expected_payload"]
+    target = engine_at(tmp_path / "unicode-golden.db")
+    app = create_app(target)
+    try:
+        with TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000)) as client:
+            rejected = client.post(
+                "/api/v1/sync/preview",
+                data={"passphrase": sample["passphrase"] + "-wrong"},
+                files={"package": (sample["filename"], package, "application/vnd.affiliate-report.sync")},
+            )
+            assert rejected.status_code == 422
+            assert rejected.json() == {"detail": AUTHENTICATION_ERROR}
+            assert app.state.sync._previews == {}
+
+            preview = client.post(
+                "/api/v1/sync/preview",
+                data={"passphrase": sample["passphrase"]},
+                files={"package": (sample["filename"], package, "application/vnd.affiliate-report.sync")},
+            )
+            assert preview.status_code == 200, preview.text
+            body = preview.json()
+            assert body["package_id"] == payload["manifest"]["package_id"]
+            assert body["counts"] == payload["manifest"]["counts"]
+            assert body["source_device"] == payload["manifest"]["source_device"]
+            assert body["conflicts"] == []
+            assert body["duplicate"] is False
+            with target.connect() as conn:
+                assert conn.execute(select(func.count()).select_from(import_batches)).scalar_one() == 0
+
+            imported = client.post(
+                "/api/v1/sync/import",
+                json={"preview_id": body["preview_id"], "confirmation": CONFIRMATION_PHRASE, "conflict_resolutions": {}},
+            )
+            assert imported.status_code == 200, imported.text
+            assert imported.json()["package_id"] == payload["manifest"]["package_id"]
+            assert imported.json()["rebuilt"] == {"versions": 1, "current": 1, "raw_rows": 1}
+            assert imported.json()["changed"] is True
+            with target.connect() as conn:
+                account = conn.execute(select(accounts)).mappings().one()
+                assert account["code"] == payload["data"]["accounts"][0]["code"]
+                assert account["display_name"] == payload["data"]["accounts"][0]["display_name"]
+                batch = conn.execute(select(import_batches)).mappings().one()
+                assert batch["file_sha"] == payload["data"]["import_batches"][0]["file_sha"]
+                raw = conn.execute(select(raw_import_rows)).mappings().one()
+                assert raw["raw_json"] == payload["data"]["raw_rows"][0]["raw_json"]
+                order = conn.execute(select(order_line_versions)).mappings().one()
+                assert order["business_key"] == payload["data"]["raw_rows"][0]["business_key"]
+                assert order["product_name"] == raw["raw_json"]["Tên sản phẩm"]
+                assert order["gmv"] == raw["raw_json"]["GMV"] == 123456
+                assert order["estimated_commission"] == 13500
+                assert order["is_current"] is True
+                target_row = conn.execute(select(monthly_targets)).mappings().one()
+                assert target_row["daily_target_commission"] == payload["data"]["targets"][0]["daily_target_commission"]
+                history = conn.execute(select(sync_history)).mappings().one()
+                assert history["package_hash"] == sample["package_sha256"]
+                assert history["direction"] == "import"
+    finally:
+        target.dispose()
+
+
+@pytest.mark.parametrize("state", ["fresh", "restored"])
+def test_affsync_unicode_android_cross_check_phase_round_trips_through_desktop(tmp_path, monkeypatch, state):
+    """Run the emulator cross-check phase in-process against the real Android-mode FastAPI app."""
+    from scripts.ci import android_runtime_smoke as smoke
+
+    token = "android-test-token-which-is-at-least-32-bytes"
+    monkeypatch.setenv("APP_PLATFORM", "android")
+    monkeypatch.setenv("ANDROID_LOCAL_TOKEN", token)
+    if state == "fresh":
+        engine = engine_at(tmp_path / "android.db")
+    else:
+        # Mirrors the emulator order: cross-check runs after restore rebuilt the DB from a package.
+        source = imported_engine(tmp_path / "before-clear.db", account=smoke.ACCOUNT)
+        try:
+            package, _ = SyncService(source).export_package(smoke.PASSPHRASE)
+        finally:
+            source.dispose()
+        engine = engine_at(tmp_path / "android.db")
+        restore = SyncService(engine)
+        preview = restore.preview(package, smoke.PASSPHRASE)
+        restore.import_preview(preview["preview_id"], CONFIRMATION_PHRASE, {})
+    try:
+        with TestClient(
+            create_app(engine),
+            base_url="http://127.0.0.1",
+            client=("127.0.0.1", 50000),
+            headers={"X-Android-Local-Token": token},
+        ) as client:
+            result = smoke._cross_check(client, APP_VERSION)
+    finally:
+        engine.dispose()
+
+    manifest = json.loads((UNICODE_FIXTURES / "manifest.json").read_text(encoding="utf-8"))
+    imported = result["desktop_to_android"]
+    assert [item["filename"] for item in imported] == sorted(sample["filename"] for sample in manifest["samples"])
+    assert all(item["rejected_normalizations"] >= 1 for item in imported)
+    assert sum(item["summary"]["new_accounts"] for item in imported) == 1
+    assert all(item["summary"]["new_raw_rows"] == 0 for item in imported[1:])
+    returned = result["android_to_desktop"]
+    assert returned["rejected_normalizations"] >= 1
+    assert set(returned["return_summary"].values()) == {0}
+    assert returned["counts"]["accounts"] == 1 + (state == "restored")
 
 
 def engine_at(path: Path):

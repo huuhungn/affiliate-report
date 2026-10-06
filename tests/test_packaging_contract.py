@@ -445,6 +445,21 @@ def test_android_candidate_is_signed_once_and_promoted_by_exact_sha():
         assert "^[A-Za-z0-9_-]{43}$" in text
         assert 'test "${#raw}" -eq 43' in text
     upgrade_smoke = Path("scripts/ci/android_signed_upgrade_smoke.sh").read_text(encoding="utf-8")
+    emulator_smoke = Path("scripts/ci/android_emulator_smoke.sh").read_text(encoding="utf-8")
+    runtime_smoke = Path("scripts/ci/android_runtime_smoke.py").read_text(encoding="utf-8")
+
+    # Cross-check runs after restore and drives the real desktop SyncService against the
+    # emulator, so the job must install the desktop runtime stack, not httpx alone.
+    restore_phase = 'android_runtime_smoke.py --phase restore --package "$package"'
+    cross_check_phase = 'android_runtime_smoke.py --phase cross-check --package "$package"'
+    assert emulator_smoke.index(restore_phase) < emulator_smoke.index(cross_check_phase)
+    assert "--phase cross-check" not in upgrade_smoke
+    emulator_job = android[android.index("  emulator-smoke:"):android.index("  signed-candidate:")]
+    assert "pip install --disable-pip-version-check -r requirements-api.txt" in emulator_job
+    assert 'choices=("seed", "persist", "cross-check", "restore")' in runtime_smoke
+    assert 'UNICODE_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "affsync_unicode"' in runtime_smoke
+    assert 'unicodedata.normalize("NFD"' in runtime_smoke
+    assert 'unicodedata.normalize("NFC"' in runtime_smoke
 
     assert "push:\n    branches: [main]" in android
     assert "pull_request:\n    branches: [main]" in android
@@ -520,6 +535,8 @@ def test_local_android_emulator_scripts_cover_supported_api_levels_and_cleanup()
         'Invoke-RuntimeSmoke -Phase "seed"',
         'Invoke-RuntimeSmoke -Phase "persist"',
         'Invoke-RuntimeSmoke -Phase "restore"',
+        '$crossChecked = Invoke-RuntimeSmoke -Phase "cross-check"',
+        "cross_checked = $crossChecked",
         'Invoke-Adb -Arguments @("-s", $serial, "emu", "kill")',
         'schema = "affiliate-report.android-local-smoke.v1"',
         'AffiliateReport-v$appVersion-x86_64-debug.apk',

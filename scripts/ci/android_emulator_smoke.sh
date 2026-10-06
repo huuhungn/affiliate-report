@@ -48,4 +48,5 @@ adb shell pm clear vn.io.huuhungn.affiliatereport
 adb shell am start -W -n vn.io.huuhungn.affiliatereport/.MainActivity
 read_token
 python scripts/ci/android_runtime_smoke.py --phase restore --package "$package"
+python scripts/ci/android_runtime_smoke.py --phase cross-check --package "$package"
 adb shell pidof vn.io.huuhungn.affiliatereport
