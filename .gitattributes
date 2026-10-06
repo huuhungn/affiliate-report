@@ -9,3 +9,6 @@ packaging/TikTokAffiliateUpdater-*.ps1 -text
 
 # GitHub Android emulator jobs execute these scripts on Linux.
 scripts/ci/*.sh text eol=lf
+
+# Golden .affsync fixtures are AES-GCM ciphertext; any byte rewrite breaks decryption.
+*.affsync binary

@@ -108,7 +108,7 @@ function Read-AndroidToken {
 }
 
 function Invoke-RuntimeSmoke {
-    param([Parameter(Mandatory = $true)][ValidateSet("seed", "persist", "restore")][string]$Phase)
+    param([Parameter(Mandatory = $true)][ValidateSet("seed", "persist", "restore", "cross-check")][string]$Phase)
 
     $previousErrorActionPreference = $ErrorActionPreference
     try {
@@ -271,6 +271,7 @@ try {
     Start-App
     $env:ANDROID_LOCAL_TOKEN = Read-AndroidToken
     $restored = Invoke-RuntimeSmoke -Phase "restore"
+    $crossChecked = Invoke-RuntimeSmoke -Phase "cross-check"
 
     $summary = [ordered]@{
         schema = "affiliate-report.android-local-smoke.v1"
@@ -288,6 +289,7 @@ try {
         rotated = $rotated
         restarted = $restarted
         restored = $restored
+        cross_checked = $crossChecked
     }
     $summaryJson = $summary | ConvertTo-Json -Depth 12
     [System.IO.File]::WriteAllText($summaryPath, $summaryJson + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
