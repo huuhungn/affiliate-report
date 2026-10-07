@@ -1,3 +1,8 @@
 allowBuilds:
   esbuild: true
   workerd: true
+overrides:
+  # miniflare pins sharp to an exact 0.35.4, which carries GHSA-wq5f-xc86-pv6w
+  # (libvips/librsvg). Even the latest wrangler still resolves that miniflare, so
+  # Dependabot cannot raise it. Drop this once miniflare depends on sharp >= 0.35.5.
+  "miniflare>sharp": 0.35.5
